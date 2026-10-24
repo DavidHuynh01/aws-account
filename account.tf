@@ -8,6 +8,10 @@ variable "alert_email" {
 
 # A hard-to-miss warning before a surprise bill: an email once actual spend
 # for the month passes $2.
+#
+# Credits are left out of the total on purpose. The account is on AWS's free
+# plan, and with credits counted the bill nets to $0, so the alert could never
+# fire however much was being used until the credits ran out.
 resource "aws_budgets_budget" "monthly" {
   name              = "My Zero-Spend Budget"
   budget_type       = "COST"
@@ -16,6 +20,10 @@ resource "aws_budgets_budget" "monthly" {
   time_unit         = "MONTHLY"
   time_period_start = "2026-10-01_00:00"
   billing_view_arn  = "arn:aws:billing::${local.account_id}:billingview/primary"
+
+  cost_types {
+    include_credit = false
+  }
 
   notification {
     notification_type          = "ACTUAL"
