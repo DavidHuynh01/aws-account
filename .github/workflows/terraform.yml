@@ -1,0 +1,82 @@
+name: terraform
+
+# Plans only. CI can read the account but never change it; a person reviews
+# the plan and runs `terraform apply` themselves.
+on:
+  pull_request:
+  push:
+    branches: [main]
+  # Weekly drift check: fails if anything was changed outside Terraform.
+  schedule:
+    - cron: "0 14 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+# Never two plans at once; each one takes the state lock.
+concurrency:
+  group: terraform
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    name: plan
+    runs-on: ubuntu-24.04
+    env:
+      TF_IN_AUTOMATION: "1"
+      TF_VAR_alert_email: ${{ secrets.ALERT_EMAIL }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: hashicorp/setup-terraform@dfe3c3f87815947d99a8997f908cb6525fc44e9e # v4.0.1
+        with:
+          terraform_version: 1.16.6
+          terraform_wrapper: false
+
+      - name: Format
+        run: terraform fmt -check -recursive
+
+      - uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: us-east-1
+          mask-aws-account-id: true
+
+      - name: Init
+        run: terraform init -input=false -lockfile=readonly
+
+      - name: Validate
+        run: terraform validate -no-color
+
+      # The raw plan goes to a file, not the log: the repo is public and the
+      # plan is full of ARNs. Exit code 2 means "changes", which isn't an error.
+      - name: Plan
+        id: plan
+        run: |
+          set +e
+          terraform plan -input=false -no-color -lock-timeout=120s -detailed-exitcode -out=tfplan > plan.log 2>&1
+          code=$?
+          set -e
+          if [ "$code" = 1 ]; then grep -E "^(Error|│)" plan.log | sed -E 's/[0-9]{12}/<account>/g'; exit 1; fi
+          echo "changes=$([ "$code" = 2 ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
+          terraform show -json tfplan > plan.json
+
+      - name: Summary
+        run: python3 scripts/plan_summary.py plan.json >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Policy tests
+        run: |
+          pip install -r requirements-dev.txt
+          pytest -q tests
+
+      - name: Drift
+        if: github.event_name == 'schedule' && steps.plan.outputs.changes == 'true'
+        run: |
+          echo "::error::The account has drifted from the code; see the summary."
+          exit 1
